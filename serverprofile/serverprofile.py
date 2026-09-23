@@ -27,7 +27,7 @@ MAX_NICKNAME_LENGTH = 32
 
 
 class ServerProfile(commands.Cog):
-    """Per-server bot profile controls."""
+    """Server-specific bot profile controls for ModmailDev."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -35,15 +35,27 @@ class ServerProfile(commands.Cog):
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=20)
+            timeout=aiohttp.ClientTimeout(total=30)
         )
 
     async def cog_unload(self):
-        if self.session and not self.session.closed:
+        if self.session is not None and not self.session.closed:
             await self.session.close()
 
     # =========================================================
-    # Helpers
+    # HTTP SESSION
+    # =========================================================
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+
+        return self.session
+
+    # =========================================================
+    # BOT TOKEN
     # =========================================================
 
     def _token(self) -> str:
@@ -63,54 +75,60 @@ class ServerProfile(commands.Cog):
 
         return token
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=20)
-            )
+    # =========================================================
+    # PERMISSIONS
+    # =========================================================
 
-        return self.session
+    def _is_admin(self, ctx: commands.Context) -> bool:
+        if ctx.guild is None:
+            return False
 
-    def _admin_check(self, ctx: commands.Context) -> bool:
-        return (
-            ctx.guild is not None
-            and isinstance(ctx.author, discord.Member)
-            and ctx.author.guild_permissions.administrator
-        )
+        if not isinstance(ctx.author, discord.Member):
+            return False
 
-    async def _deny_if_needed(
+        return ctx.author.guild_permissions.administrator
+
+    async def _check_permissions(
         self,
         ctx: commands.Context,
     ) -> bool:
-
         if ctx.guild is None:
             await ctx.send(
                 "❌ This command can only be used inside a server."
             )
-            return True
+            return False
 
-        if not self._admin_check(ctx):
+        if not self._is_admin(ctx):
             await ctx.send(
                 "❌ You need the **Administrator** permission "
                 "to manage the bot's server profile."
             )
-            return True
+            return False
 
-        return False
+        return True
+
+    # =========================================================
+    # ERROR HANDLING
+    # =========================================================
 
     def _error_text(self, exc: Exception) -> str:
         if isinstance(exc, discord.HTTPException):
-
             if exc.status == 400:
                 return (
-                    "Discord rejected one of the supplied values. "
-                    "Check the image format, size, or profile value."
+                    "Discord rejected the request. "
+                    "Check the supplied value or image."
+                )
+
+            if exc.status == 401:
+                return (
+                    "The bot token was rejected by Discord."
                 )
 
             if exc.status == 403:
                 return (
-                    "Discord denied the change. Make sure the bot "
-                    "is allowed to modify its server profile."
+                    "Discord denied the change. "
+                    "The bot may not have permission to change "
+                    "its server profile."
                 )
 
             if exc.status == 404:
@@ -129,7 +147,7 @@ class ServerProfile(commands.Cog):
         return str(exc)
 
     # =========================================================
-    # Discord API
+    # MODIFY SERVER PROFILE
     # =========================================================
 
     async def _modify_current_member(
@@ -147,7 +165,8 @@ class ServerProfile(commands.Cog):
         """
         Modify the bot's server-specific profile.
 
-        Endpoint:
+        Discord endpoint:
+
         PATCH /guilds/{guild.id}/members/@me
         """
 
@@ -172,7 +191,9 @@ class ServerProfile(commands.Cog):
             )
 
         if not payload:
-            raise ValueError("Nothing to change.")
+            raise ValueError(
+                "There is nothing to change."
+            )
 
         session = await self._get_session()
 
@@ -210,7 +231,7 @@ class ServerProfile(commands.Cog):
                 return body
 
     # =========================================================
-    # Image handling
+    # DOWNLOAD IMAGE
     # =========================================================
 
     async def _image_to_data_uri(
@@ -228,8 +249,7 @@ class ServerProfile(commands.Cog):
             re.IGNORECASE,
         ):
             raise ValueError(
-                "The image must be a valid "
-                "http:// or https:// URL."
+                "The image must be a valid HTTP or HTTPS URL."
             )
 
         session = await self._get_session()
@@ -247,7 +267,7 @@ class ServerProfile(commands.Cog):
 
             if response.status != 200:
                 raise ValueError(
-                    f"Could not download that image "
+                    f"Could not download the image "
                     f"(HTTP {response.status})."
                 )
 
@@ -258,50 +278,54 @@ class ServerProfile(commands.Cog):
                 .lower()
             )
 
-            extension = IMAGE_TYPES.get(
-                content_type
-            )
+            # -------------------------------------------------
+            # Detect image type from Content-Type.
+            # -------------------------------------------------
+
+            extension = IMAGE_TYPES.get(content_type)
 
             # -------------------------------------------------
-            # Determine image type from URL if the server gives
-            # us a generic Content-Type.
+            # Some image hosts return a generic Content-Type.
+            # Fall back to the final URL.
             # -------------------------------------------------
 
             if extension is None:
 
-                lower_url = (
+                final_url = (
                     str(response.url)
                     .lower()
                     .split("?", 1)[0]
                 )
 
-                if lower_url.endswith(".png"):
+                if final_url.endswith(".png"):
                     content_type = "image/png"
 
-                elif lower_url.endswith(
+                elif final_url.endswith(
                     (".jpg", ".jpeg")
                 ):
                     content_type = "image/jpeg"
 
-                elif lower_url.endswith(".gif"):
+                elif final_url.endswith(".gif"):
                     content_type = "image/gif"
 
-                elif lower_url.endswith(".webp"):
+                elif final_url.endswith(".webp"):
                     content_type = "image/webp"
 
                 else:
                     raise ValueError(
-                        "That URL does not appear to point "
-                        "to a supported image. Use PNG, JPG, "
-                        "GIF or WEBP."
+                        "The URL does not appear to point to "
+                        "a supported image. Use PNG, JPG, GIF "
+                        "or WEBP."
                     )
 
             # -------------------------------------------------
-            # Read in chunks so we can enforce the size limit.
+            # Read safely in chunks.
             #
-            # IMPORTANT:
-            # aiohttp response.read() does NOT accept a size
-            # argument.
+            # DO NOT use:
+            #
+            # await response.read(MAX_IMAGE_BYTES)
+            #
+            # aiohttp read() doesn't accept a size argument.
             # -------------------------------------------------
 
             data = bytearray()
@@ -330,23 +354,25 @@ class ServerProfile(commands.Cog):
                 f"data:{content_type};base64,{encoded}"
             )
 
+    # =========================================================
+    # GET IMAGE FROM URL OR ATTACHMENT
+    # =========================================================
+
     async def _get_image_url(
         self,
         ctx: commands.Context,
         supplied_url: Optional[str],
     ) -> Optional[str]:
-        """
-        Get an image URL either from the command argument
-        or from the first Discord attachment.
-        """
 
+        # URL supplied in command
         if supplied_url:
             return supplied_url.strip()
 
+        # Image attached to Discord message
         if ctx.message.attachments:
+
             attachment = ctx.message.attachments[0]
 
-            # Only allow image attachments.
             content_type = (
                 attachment.content_type or ""
             ).lower()
@@ -354,11 +380,18 @@ class ServerProfile(commands.Cog):
             if content_type.startswith("image/"):
                 return attachment.url
 
-            # Discord sometimes doesn't provide a content type.
-            filename = attachment.filename.lower()
+            filename = (
+                attachment.filename or ""
+            ).lower()
 
             if filename.endswith(
-                (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                (
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".webp",
+                )
             ):
                 return attachment.url
 
@@ -370,7 +403,7 @@ class ServerProfile(commands.Cog):
         return None
 
     # =========================================================
-    # Main command
+    # MAIN COMMAND
     # =========================================================
 
     @commands.command(
@@ -387,13 +420,14 @@ class ServerProfile(commands.Cog):
         *,
         value: Optional[str] = None,
     ):
+        """Manage the bot's server-specific profile."""
 
-        if await self._deny_if_needed(ctx):
+        if not await self._check_permissions(ctx):
             return
 
-        # =====================================================
+        # -----------------------------------------------------
         # HELP
-        # =====================================================
+        # -----------------------------------------------------
 
         if not action:
 
@@ -420,7 +454,7 @@ class ServerProfile(commands.Cog):
                 value=(
                     f"`{ctx.clean_prefix}"
                     "botprofile avatar <image-url>`\n"
-                    "or attach an image"
+                    "You can also attach an image."
                 ),
                 inline=False,
             )
@@ -430,7 +464,7 @@ class ServerProfile(commands.Cog):
                 value=(
                     f"`{ctx.clean_prefix}"
                     "botprofile banner <image-url>`\n"
-                    "or attach an image"
+                    "You can also attach an image."
                 ),
                 inline=False,
             )
@@ -502,6 +536,7 @@ class ServerProfile(commands.Cog):
                 )
 
             except Exception as exc:
+
                 await ctx.send(
                     f"❌ {self._error_text(exc)}"
                 )
@@ -524,9 +559,8 @@ class ServerProfile(commands.Cog):
                 if not image_url:
                     await ctx.send(
                         f"❌ Usage: `{ctx.clean_prefix}"
-                        "botprofile avatar <image-url>`\n"
-                        "You can also attach an image "
-                        "to the command."
+                        "botprofile avatar <image-url>`\n\n"
+                        "Or attach an image to the command."
                     )
                     return
 
@@ -545,6 +579,7 @@ class ServerProfile(commands.Cog):
                 )
 
             except Exception as exc:
+
                 await ctx.send(
                     f"❌ {self._error_text(exc)}"
                 )
@@ -567,9 +602,8 @@ class ServerProfile(commands.Cog):
                 if not image_url:
                     await ctx.send(
                         f"❌ Usage: `{ctx.clean_prefix}"
-                        "botprofile banner <image-url>`\n"
-                        "You can also attach an image "
-                        "to the command."
+                        "botprofile banner <image-url>`\n\n"
+                        "Or attach an image to the command."
                     )
                     return
 
@@ -588,6 +622,7 @@ class ServerProfile(commands.Cog):
                 )
 
             except Exception as exc:
+
                 await ctx.send(
                     f"❌ {self._error_text(exc)}"
                 )
@@ -620,6 +655,7 @@ class ServerProfile(commands.Cog):
                 )
 
             except Exception as exc:
+
                 await ctx.send(
                     f"❌ {self._error_text(exc)}"
                 )
@@ -696,6 +732,7 @@ class ServerProfile(commands.Cog):
                     )
 
             except Exception as exc:
+
                 await ctx.send(
                     f"❌ {self._error_text(exc)}"
                 )
@@ -708,8 +745,11 @@ class ServerProfile(commands.Cog):
 
         await ctx.send(
             f"❌ Unknown option "
-            f"`{discord.utils.escape_markdown(action)}`.\n"
-            f"Use `{ctx.clean_prefix}botprofile` "
-            "to see the available options."
+            f"`{discord.utils.escape_markdown(action)}`.\n\n"
+            f"Use `{ctx.clean_prefix}"
+            "botprofile` to see the available options."
         )
 
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(ServerProfile(bot))
