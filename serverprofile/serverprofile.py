@@ -42,18 +42,24 @@ class ServerProfile(commands.Cog):
         if self.session and not self.session.closed:
             await self.session.close()
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Helpers
-    # ---------------------------------------------------------
+    # =========================================================
 
     def _token(self) -> str:
-        token = getattr(getattr(self.bot, "http", None), "token", None)
+        token = getattr(
+            getattr(self.bot, "http", None),
+            "token",
+            None,
+        )
 
         if not token:
             token = getattr(self.bot, "token", None)
 
         if not token:
-            raise RuntimeError("Could not obtain the bot token from Modmail.")
+            raise RuntimeError(
+                "Could not obtain the bot token from Modmail."
+            )
 
         return token
 
@@ -72,7 +78,11 @@ class ServerProfile(commands.Cog):
             and ctx.author.guild_permissions.administrator
         )
 
-    async def _deny_if_needed(self, ctx: commands.Context) -> bool:
+    async def _deny_if_needed(
+        self,
+        ctx: commands.Context,
+    ) -> bool:
+
         if ctx.guild is None:
             await ctx.send(
                 "❌ This command can only be used inside a server."
@@ -81,8 +91,8 @@ class ServerProfile(commands.Cog):
 
         if not self._admin_check(ctx):
             await ctx.send(
-                "❌ You need the **Administrator** permission to manage "
-                "the bot's server profile."
+                "❌ You need the **Administrator** permission "
+                "to manage the bot's server profile."
             )
             return True
 
@@ -90,6 +100,7 @@ class ServerProfile(commands.Cog):
 
     def _error_text(self, exc: Exception) -> str:
         if isinstance(exc, discord.HTTPException):
+
             if exc.status == 400:
                 return (
                     "Discord rejected one of the supplied values. "
@@ -98,8 +109,8 @@ class ServerProfile(commands.Cog):
 
             if exc.status == 403:
                 return (
-                    "Discord denied the change. Make sure the bot is "
-                    "allowed to modify its server profile."
+                    "Discord denied the change. Make sure the bot "
+                    "is allowed to modify its server profile."
                 )
 
             if exc.status == 404:
@@ -117,9 +128,9 @@ class ServerProfile(commands.Cog):
 
         return str(exc)
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Discord API
-    # ---------------------------------------------------------
+    # =========================================================
 
     async def _modify_current_member(
         self,
@@ -146,13 +157,19 @@ class ServerProfile(commands.Cog):
             payload["nick"] = nick
 
         if avatar is not None or reset_avatar:
-            payload["avatar"] = None if reset_avatar else avatar
+            payload["avatar"] = (
+                None if reset_avatar else avatar
+            )
 
         if banner is not None or reset_banner:
-            payload["banner"] = None if reset_banner else banner
+            payload["banner"] = (
+                None if reset_banner else banner
+            )
 
         if bio is not None or reset_bio:
-            payload["bio"] = None if reset_bio else bio
+            payload["bio"] = (
+                None if reset_bio else bio
+            )
 
         if not payload:
             raise ValueError("Nothing to change.")
@@ -192,16 +209,27 @@ class ServerProfile(commands.Cog):
             except json.JSONDecodeError:
                 return body
 
-    # ---------------------------------------------------------
+    # =========================================================
     # Image handling
-    # ---------------------------------------------------------
+    # =========================================================
 
-    async def _image_to_data_uri(self, url: str) -> str:
-        """Download an image and convert it into a Discord data URI."""
+    async def _image_to_data_uri(
+        self,
+        url: str,
+    ) -> str:
+        """
+        Download an image and convert it into
+        a Discord data URI.
+        """
 
-        if not re.match(r"^https?://", url, re.IGNORECASE):
+        if not re.match(
+            r"^https?://",
+            url,
+            re.IGNORECASE,
+        ):
             raise ValueError(
-                "The image must be a valid http:// or https:// URL."
+                "The image must be a valid "
+                "http:// or https:// URL."
             )
 
         session = await self._get_session()
@@ -230,10 +258,17 @@ class ServerProfile(commands.Cog):
                 .lower()
             )
 
-            extension = IMAGE_TYPES.get(content_type)
+            extension = IMAGE_TYPES.get(
+                content_type
+            )
 
-            # Some image hosts return application/octet-stream.
+            # -------------------------------------------------
+            # Determine image type from URL if the server gives
+            # us a generic Content-Type.
+            # -------------------------------------------------
+
             if extension is None:
+
                 lower_url = (
                     str(response.url)
                     .lower()
@@ -243,7 +278,9 @@ class ServerProfile(commands.Cog):
                 if lower_url.endswith(".png"):
                     content_type = "image/png"
 
-                elif lower_url.endswith((".jpg", ".jpeg")):
+                elif lower_url.endswith(
+                    (".jpg", ".jpeg")
+                ):
                     content_type = "image/jpeg"
 
                 elif lower_url.endswith(".gif"):
@@ -254,24 +291,87 @@ class ServerProfile(commands.Cog):
 
                 else:
                     raise ValueError(
-                        "That URL does not appear to point to a "
-                        "supported image. Use PNG, JPG, GIF or WEBP."
+                        "That URL does not appear to point "
+                        "to a supported image. Use PNG, JPG, "
+                        "GIF or WEBP."
                     )
 
-            data = await response.read(MAX_IMAGE_BYTES + 1)
+            # -------------------------------------------------
+            # Read in chunks so we can enforce the size limit.
+            #
+            # IMPORTANT:
+            # aiohttp response.read() does NOT accept a size
+            # argument.
+            # -------------------------------------------------
 
-            if len(data) > MAX_IMAGE_BYTES:
+            data = bytearray()
+
+            async for chunk in response.content.iter_chunked(
+                64 * 1024
+            ):
+                data.extend(chunk)
+
+                if len(data) > MAX_IMAGE_BYTES:
+                    raise ValueError(
+                        "The image is larger than the "
+                        "10 MB upload limit."
+                    )
+
+            if not data:
                 raise ValueError(
-                    "The image is larger than the 10 MB upload limit."
+                    "The image is empty."
                 )
 
-            encoded = base64.b64encode(data).decode("ascii")
+            encoded = base64.b64encode(
+                bytes(data)
+            ).decode("ascii")
 
-            return f"data:{content_type};base64,{encoded}"
+            return (
+                f"data:{content_type};base64,{encoded}"
+            )
 
-    # ---------------------------------------------------------
+    async def _get_image_url(
+        self,
+        ctx: commands.Context,
+        supplied_url: Optional[str],
+    ) -> Optional[str]:
+        """
+        Get an image URL either from the command argument
+        or from the first Discord attachment.
+        """
+
+        if supplied_url:
+            return supplied_url.strip()
+
+        if ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+
+            # Only allow image attachments.
+            content_type = (
+                attachment.content_type or ""
+            ).lower()
+
+            if content_type.startswith("image/"):
+                return attachment.url
+
+            # Discord sometimes doesn't provide a content type.
+            filename = attachment.filename.lower()
+
+            if filename.endswith(
+                (".png", ".jpg", ".jpeg", ".gif", ".webp")
+            ):
+                return attachment.url
+
+            raise ValueError(
+                "The attached file does not appear to be "
+                "a supported image."
+            )
+
+        return None
+
+    # =========================================================
     # Main command
-    # ---------------------------------------------------------
+    # =========================================================
 
     @commands.command(
         name="botprofile",
@@ -287,34 +387,21 @@ class ServerProfile(commands.Cog):
         *,
         value: Optional[str] = None,
     ):
-        """
-        Manage the bot's server-specific profile.
-
-        Usage:
-
-        botprofile
-        botprofile name <name>
-        botprofile avatar <url>
-        botprofile banner <url>
-        botprofile bio <text>
-        botprofile reset avatar
-        botprofile reset banner
-        botprofile reset bio
-        botprofile reset all
-        """
 
         if await self._deny_if_needed(ctx):
             return
 
-        # -----------------------------------------------------
-        # Help
-        # -----------------------------------------------------
+        # =====================================================
+        # HELP
+        # =====================================================
 
         if not action:
+
             embed = discord.Embed(
                 title="🤖 Bot Server Profile",
                 description=(
-                    "Change how the bot appears **in this server only**."
+                    "Change how the bot appears "
+                    "**in this server only**."
                 ),
                 colour=discord.Colour.blurple(),
             )
@@ -323,7 +410,7 @@ class ServerProfile(commands.Cog):
                 name="✏️ Name",
                 value=(
                     f"`{ctx.clean_prefix}"
-                    f"botprofile name <name>`"
+                    "botprofile name <name>`"
                 ),
                 inline=False,
             )
@@ -332,7 +419,8 @@ class ServerProfile(commands.Cog):
                 name="🖼️ Avatar",
                 value=(
                     f"`{ctx.clean_prefix}"
-                    f"botprofile avatar <image-url>`"
+                    "botprofile avatar <image-url>`\n"
+                    "or attach an image"
                 ),
                 inline=False,
             )
@@ -341,7 +429,8 @@ class ServerProfile(commands.Cog):
                 name="🎨 Banner",
                 value=(
                     f"`{ctx.clean_prefix}"
-                    f"botprofile banner <image-url>`"
+                    "botprofile banner <image-url>`\n"
+                    "or attach an image"
                 ),
                 inline=False,
             )
@@ -350,7 +439,7 @@ class ServerProfile(commands.Cog):
                 name="📝 Bio",
                 value=(
                     f"`{ctx.clean_prefix}"
-                    f"botprofile bio <text>`"
+                    "botprofile bio <text>`"
                 ),
                 inline=False,
             )
@@ -358,10 +447,14 @@ class ServerProfile(commands.Cog):
             embed.add_field(
                 name="♻️ Reset",
                 value=(
-                    f"`{ctx.clean_prefix}botprofile reset avatar`\n"
-                    f"`{ctx.clean_prefix}botprofile reset banner`\n"
-                    f"`{ctx.clean_prefix}botprofile reset bio`\n"
-                    f"`{ctx.clean_prefix}botprofile reset all`"
+                    f"`{ctx.clean_prefix}"
+                    "botprofile reset avatar`\n"
+                    f"`{ctx.clean_prefix}"
+                    "botprofile reset banner`\n"
+                    f"`{ctx.clean_prefix}"
+                    "botprofile reset bio`\n"
+                    f"`{ctx.clean_prefix}"
+                    "botprofile reset all`"
                 ),
                 inline=False,
             )
@@ -376,16 +469,16 @@ class ServerProfile(commands.Cog):
         action = action.lower().strip()
         value = (value or "").strip()
 
-        # -----------------------------------------------------
-        # Name
-        # -----------------------------------------------------
+        # =====================================================
+        # NAME
+        # =====================================================
 
         if action == "name":
 
             if not value:
                 await ctx.send(
                     f"❌ Usage: `{ctx.clean_prefix}"
-                    f"botprofile name <name>`"
+                    "botprofile name <name>`"
                 )
                 return
 
@@ -397,6 +490,7 @@ class ServerProfile(commands.Cog):
                 return
 
             try:
+
                 await self._modify_current_member(
                     ctx.guild,
                     nick=value,
@@ -414,21 +508,31 @@ class ServerProfile(commands.Cog):
 
             return
 
-        # -----------------------------------------------------
-        # Avatar
-        # -----------------------------------------------------
+        # =====================================================
+        # AVATAR
+        # =====================================================
 
         if action == "avatar":
 
-            if not value:
-                await ctx.send(
-                    f"❌ Usage: `{ctx.clean_prefix}"
-                    f"botprofile avatar <image-url>`"
-                )
-                return
-
             try:
-                data_uri = await self._image_to_data_uri(value)
+
+                image_url = await self._get_image_url(
+                    ctx,
+                    value or None,
+                )
+
+                if not image_url:
+                    await ctx.send(
+                        f"❌ Usage: `{ctx.clean_prefix}"
+                        "botprofile avatar <image-url>`\n"
+                        "You can also attach an image "
+                        "to the command."
+                    )
+                    return
+
+                data_uri = await self._image_to_data_uri(
+                    image_url
+                )
 
                 await self._modify_current_member(
                     ctx.guild,
@@ -436,7 +540,8 @@ class ServerProfile(commands.Cog):
                 )
 
                 await ctx.send(
-                    "✅ The bot's **server avatar** has been changed."
+                    "✅ The bot's **server avatar** "
+                    "has been changed."
                 )
 
             except Exception as exc:
@@ -446,21 +551,31 @@ class ServerProfile(commands.Cog):
 
             return
 
-        # -----------------------------------------------------
-        # Banner
-        # -----------------------------------------------------
+        # =====================================================
+        # BANNER
+        # =====================================================
 
         if action == "banner":
 
-            if not value:
-                await ctx.send(
-                    f"❌ Usage: `{ctx.clean_prefix}"
-                    f"botprofile banner <image-url>`"
-                )
-                return
-
             try:
-                data_uri = await self._image_to_data_uri(value)
+
+                image_url = await self._get_image_url(
+                    ctx,
+                    value or None,
+                )
+
+                if not image_url:
+                    await ctx.send(
+                        f"❌ Usage: `{ctx.clean_prefix}"
+                        "botprofile banner <image-url>`\n"
+                        "You can also attach an image "
+                        "to the command."
+                    )
+                    return
+
+                data_uri = await self._image_to_data_uri(
+                    image_url
+                )
 
                 await self._modify_current_member(
                     ctx.guild,
@@ -468,7 +583,8 @@ class ServerProfile(commands.Cog):
                 )
 
                 await ctx.send(
-                    "✅ The bot's **server banner** has been changed."
+                    "✅ The bot's **server banner** "
+                    "has been changed."
                 )
 
             except Exception as exc:
@@ -478,9 +594,9 @@ class ServerProfile(commands.Cog):
 
             return
 
-        # -----------------------------------------------------
-        # Bio
-        # -----------------------------------------------------
+        # =====================================================
+        # BIO
+        # =====================================================
 
         if action == "bio":
 
@@ -492,13 +608,15 @@ class ServerProfile(commands.Cog):
                 return
 
             try:
+
                 await self._modify_current_member(
                     ctx.guild,
                     bio=value,
                 )
 
                 await ctx.send(
-                    "✅ The bot's **server bio** has been changed."
+                    "✅ The bot's **server bio** "
+                    "has been changed."
                 )
 
             except Exception as exc:
@@ -508,13 +626,13 @@ class ServerProfile(commands.Cog):
 
             return
 
-        # -----------------------------------------------------
-        # Reset
-        # -----------------------------------------------------
+        # =====================================================
+        # RESET
+        # =====================================================
 
         if action == "reset":
 
-            target = value.lower()
+            target = value.lower().strip()
 
             if target not in {
                 "avatar",
@@ -584,16 +702,14 @@ class ServerProfile(commands.Cog):
 
             return
 
-        # -----------------------------------------------------
-        # Unknown option
-        # -----------------------------------------------------
+        # =====================================================
+        # UNKNOWN ACTION
+        # =====================================================
 
         await ctx.send(
-            f"❌ Unknown option `{discord.utils.escape_markdown(action)}`.\n"
-            f"Use `{ctx.clean_prefix}botprofile` to see the "
-            "available options."
+            f"❌ Unknown option "
+            f"`{discord.utils.escape_markdown(action)}`.\n"
+            f"Use `{ctx.clean_prefix}botprofile` "
+            "to see the available options."
         )
 
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(ServerProfile(bot))
