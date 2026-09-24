@@ -22,6 +22,8 @@ EXCLUDED_DIRS = {
     ".mypy_cache",
     ".ruff_cache",
     ".venv",
+    ".cache",
+    ".trash",
     "venv",
     "env",
     "logs",
