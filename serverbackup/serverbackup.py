@@ -24,11 +24,14 @@ EXCLUDED_DIRS = {
     ".venv",
     "venv",
     "env",
+    "logs",
+    "tmp",
     "backups",
 }
 
 EXCLUDED_FILES = {
     ".DS_Store",
+
 }
 
 MAX_FILES = 10000
