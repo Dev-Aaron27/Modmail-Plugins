@@ -1,23 +1,30 @@
-from __future__ import annotations
-
+```python
 import asyncio
-import os
+import logging
+import math
+import shutil
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Discord user who receives the backups
 BACKUP_USER_ID = 1148212880722890783
-BACKUP_INTERVAL_HOURS = None
-MAX_FILES = 10000
-COMPRESSION = zipfile.ZIP_DEFLATED
 
-SKIP_DIRECTORIES = {
+# Maximum size of each Discord attachment.
+# 20 MB gives plenty of room below Discord's upload limit.
+PART_SIZE = 20 * 1024 * 1024
+
+# Directories that should NOT be included
+EXCLUDED_DIRS = {
     "__pycache__",
     ".git",
     ".hg",
@@ -31,468 +38,359 @@ SKIP_DIRECTORIES = {
     "backups",
 }
 
-SKIP_FILES = {
+# Files that should NOT be included
+EXCLUDED_FILES = {
     ".DS_Store",
 }
 
-SKIP_SUFFIXES = {
-    ".pyc",
-    ".pyo",
-}
+MAX_FILES = 10000
 
 
-class Backup(commands.Cog):
-    """Backup the Modmail bot's files into a ZIP and DM it."""
 
-    def __init__(self, bot: commands.Bot):
+class ServerBackup(commands.Cog):
+    """
+    Manual bot backup system.
+
+    Usage:
+        .backup
+
+    The backup is:
+        1. Created temporarily.
+        2. Split into 20 MB parts.
+        3. Sent to the configured Discord user.
+        4. Completely deleted from the server.
+    """
+
+    def __init__(self, bot):
         self.bot = bot
-        self.backup_lock = asyncio.Lock()
 
-        if BACKUP_INTERVAL_HOURS:
-            self.automatic_backup.start()
-
-    async def cog_unload(self):
-        if self.automatic_backup.is_running():
-            self.automatic_backup.cancel()
+        logging.info(
+            "[Backup] Server backup plugin loaded "
+            "(manual backups only)"
+        )
 
 
-    def _get_bot_root(self) -> Path:
+
+    def _get_bot_root(self):
         """
-        Get the bot's working directory.
+        Uses the current working directory as the bot root.
 
-        ModmailDev normally runs with the bot project as
-        the working directory.
+        This is normally the directory the ModmailDev process
+        was started from.
         """
-
-        root = Path.cwd().resolve()
-
-        if not root.exists():
-            raise RuntimeError(
-                f"Bot directory does not exist: {root}"
-            )
-
-        return root
+        return Path.cwd().resolve()
 
 
-    async def _get_backup_user(self) -> discord.User:
-        """
-        Get the Discord user who receives backups.
-        """
 
-        user = self.bot.get_user(BACKUP_USER_ID)
-
-        if user is not None:
-            return user
-
+    def _should_include(self, path: Path, root: Path):
         try:
-            user = await self.bot.fetch_user(
-                BACKUP_USER_ID
-            )
-        except discord.HTTPException as exc:
-            raise RuntimeError(
-                f"Could not find backup user: {exc}"
-            )
+            relative = path.relative_to(root)
+        except ValueError:
+            return False
 
-        return user
-
-
-
-    def _should_skip(
-        self,
-        path: Path,
-        root: Path,
-    ) -> bool:
-        """
-        Determine whether a file should be excluded.
-        """
-
-        relative = path.relative_to(root)
-
-        # Skip excluded directories.
+        # Skip excluded directories
         for part in relative.parts[:-1]:
-            if part in SKIP_DIRECTORIES:
-                return True
+            if part in EXCLUDED_DIRS:
+                return False
 
-        # Skip excluded filenames.
-        if path.name in SKIP_FILES:
-            return True
+        # Skip excluded files
+        if path.name in EXCLUDED_FILES:
+            return False
 
-        # Skip excluded extensions.
-        if path.suffix.lower() in SKIP_SUFFIXES:
-            return True
+        # Skip Python bytecode
+        if path.suffix.lower() in {".pyc", ".pyo"}:
+            return False
 
-        # Never include a backup ZIP.
+        # Skip previous backup files
         if path.name.startswith("modmail-backup-"):
-            return True
+            return False
 
-        return False
+        return True
 
 
+    def _create_backup(self, output_zip: Path):
+        root = self._get_bot_root()
 
-    def _create_backup(
-        self,
-        root: Path,
-    ) -> tuple[Path, int, int]:
-        """
-        Create the backup ZIP.
+        logging.info(f"[Backup] Creating backup from: {root}")
 
-        Returns:
-            (zip_path, file_count, total_bytes)
-        """
+        files = []
 
-        timestamp = datetime.now(
-            timezone.utc
-        ).strftime("%Y-%m-%d_%H-%M-%S")
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
 
-        temp_dir = Path(
-            tempfile.mkdtemp(
-                prefix="modmail-backup-"
-            )
+            if not self._should_include(path, root):
+                continue
+
+            files.append(path)
+
+            if len(files) >= MAX_FILES:
+                logging.warning(
+                    f"[Backup] Reached maximum file limit: {MAX_FILES}"
+                )
+                break
+
+        if not files:
+            raise RuntimeError("No files were found to backup.")
+
+        logging.info(
+            f"[Backup] Adding {len(files)} files to backup..."
         )
-
-        zip_path = (
-            temp_dir
-            / f"modmail-backup-{timestamp}.zip"
-        )
-
-        file_count = 0
-        total_bytes = 0
 
         with zipfile.ZipFile(
-            zip_path,
+            output_zip,
             mode="w",
-            compression=COMPRESSION,
+            compression=zipfile.ZIP_DEFLATED,
             compresslevel=6,
         ) as archive:
 
-            for path in root.rglob("*"):
-
-                if not path.is_file():
-                    continue
-
-                if self._should_skip(
-                    path,
-                    root,
-                ):
-                    continue
-
-                # Do not accidentally include the ZIP itself.
-                if path.resolve() == zip_path.resolve():
-                    continue
-
-                if file_count >= MAX_FILES:
-                    raise RuntimeError(
-                        f"Backup contains more than "
-                        f"{MAX_FILES} files."
-                    )
-
+            for file_path in files:
                 try:
-                    relative_path = path.relative_to(root)
+                    relative_path = file_path.relative_to(root)
 
                     archive.write(
-                        path,
-                        arcname=str(relative_path),
+                        file_path,
+                        arcname=relative_path,
                     )
 
-                    file_count += 1
-
-                    try:
-                        total_bytes += path.stat().st_size
-                    except OSError:
-                        pass
-
-                except (
-                    PermissionError,
-                    OSError,
-                ):
-                    # A file disappearing while the backup is
-                    # running shouldn't necessarily kill the
-                    # entire backup.
-                    continue
-
-        return (
-            zip_path,
-            file_count,
-            total_bytes,
-        )
-
-
-
-    def _format_size(
-        self,
-        size: int,
-    ) -> str:
-
-        units = (
-            "B",
-            "KB",
-            "MB",
-            "GB",
-            "TB",
-        )
-
-        value = float(size)
-
-        for unit in units:
-
-            if value < 1024:
-                return f"{value:.2f} {unit}"
-
-            value /= 1024
-
-        return f"{value:.2f} PB"
-
-
-    async def _send_backup(
-        self,
-        *,
-        automatic: bool = False,
-    ):
-
-        # Prevent two backups running at once.
-        if self.backup_lock.locked():
-            return
-
-        async with self.backup_lock:
-
-            zip_path: Optional[Path] = None
-
-            try:
-
-                root = self._get_bot_root()
-
-                user = await self._get_backup_user()
-
-                (
-                    zip_path,
-                    file_count,
-                    uncompressed_size,
-                ) = await asyncio.to_thread(
-                    self._create_backup,
-                    root,
-                )
-
-                zip_size = zip_path.stat().st_size
-
-                timestamp = datetime.now(
-                    timezone.utc
-                ).strftime(
-                    "%Y-%m-%d %H:%M:%S UTC"
-                )
-
-                embed = discord.Embed(
-                    title="📦 Modmail Bot Backup",
-                    description=(
-                        "A backup of the bot files "
-                        "has been created successfully."
-                    ),
-                    colour=discord.Colour.green(),
-                )
-
-                embed.add_field(
-                    name="📁 Files",
-                    value=str(file_count),
-                    inline=True,
-                )
-
-                embed.add_field(
-                    name="📦 ZIP Size",
-                    value=self._format_size(
-                        zip_size
-                    ),
-                    inline=True,
-                )
-
-                embed.add_field(
-                    name="💾 Original Size",
-                    value=self._format_size(
-                        uncompressed_size
-                    ),
-                    inline=True,
-                )
-
-                embed.add_field(
-                    name="🕐 Created",
-                    value=timestamp,
-                    inline=False,
-                )
-
-                embed.add_field(
-                    name="⚙️ Type",
-                    value=(
-                        "Automatic"
-                        if automatic
-                        else "Manual"
-                    ),
-                    inline=True,
-                )
-
-                embed.set_footer(
-                    text="ModmailDev Backup System"
-                )
-
-
-                await user.send(
-                    embed=embed,
-                    file=discord.File(
-                        str(zip_path),
-                        filename=zip_path.name,
-                    ),
-                )
-
-                print(
-                    "[Backup] Backup successfully sent "
-                    f"to Discord user {BACKUP_USER_ID}."
-                )
-
-            except discord.HTTPException as exc:
-
-                print(
-                    "[Backup] Discord error while "
-                    f"sending backup: {exc}"
-                )
-
-            except Exception as exc:
-
-                print(
-                    "[Backup] Backup failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-                try:
-
-                    user = await self._get_backup_user()
-
-                    await user.send(
-                        "❌ **Modmail backup failed.**\n\n"
-                        f"`{type(exc).__name__}: "
-                        f"{exc}`"
+                except (OSError, PermissionError) as error:
+                    logging.warning(
+                        f"[Backup] Could not add {file_path}: {error}"
                     )
 
-                except Exception:
-                    pass
+        size = output_zip.stat().st_size
 
-            finally:
+        logging.info(
+            f"[Backup] ZIP created: "
+            f"{size / 1024 / 1024:.2f} MB"
+        )
+
+        return size
 
 
-                if zip_path is not None:
-
-                    try:
-
-                        if zip_path.exists():
-                            zip_path.unlink()
-
-                        parent = zip_path.parent
-
-                        if parent.exists():
-                            parent.rmdir()
-
-                    except Exception:
-                        pass
-
-    @commands.command(
-        name="backup",
-        aliases=[
-            "botbackup",
-            "createbackup",
-        ],
-    )
-    @commands.is_owner()
-    async def backup(
-        self,
-        ctx: commands.Context,
-    ):
+    def _split_file(self, source: Path, output_dir: Path):
         """
-        Manually create a full bot backup.
+        Splits the completed ZIP into smaller files.
 
-        Only the bot owner can run this.
+        Each part is independently uploaded to Discord.
         """
 
-        if self.backup_lock.locked():
+        parts = []
 
-            await ctx.send(
-                "⏳ A backup is already being created."
+        total_size = source.stat().st_size
+
+        if total_size <= PART_SIZE:
+            parts.append(source)
+            return parts
+
+        logging.info(
+            f"[Backup] ZIP is too large "
+            f"({total_size / 1024 / 1024:.2f} MB). "
+            f"Splitting..."
+        )
+
+        with source.open("rb") as source_file:
+
+            part_number = 1
+
+            while True:
+                chunk = source_file.read(PART_SIZE)
+
+                if not chunk:
+                    break
+
+                part_path = (
+                    output_dir
+                    / f"modmail-backup-part-{part_number:03d}.zip"
+                )
+
+                with part_path.open("wb") as part_file:
+                    part_file.write(chunk)
+
+                parts.append(part_path)
+
+                logging.info(
+                    f"[Backup] Created part "
+                    f"{part_number}: "
+                    f"{part_path.stat().st_size / 1024 / 1024:.2f} MB"
+                )
+
+                part_number += 1
+
+        return parts
+
+
+    async def _get_backup_user(self):
+        try:
+            user = self.bot.get_user(BACKUP_USER_ID)
+
+            if user is None:
+                user = await self.bot.fetch_user(BACKUP_USER_ID)
+
+            return user
+
+        except Exception as error:
+            logging.error(
+                f"[Backup] Could not find backup user: {error}"
             )
-            return
+            return None
 
-        message = await ctx.send(
-            "📦 Creating bot backup...\n"
-            "This may take a little while."
+
+
+    async def _send_backup(self):
+
+        temp_dir = Path(
+            tempfile.mkdtemp(prefix="modmail-backup-")
         )
 
-        await self._send_backup(
-            automatic=False
-        )
+        zip_path = temp_dir / "modmail-backup.zip"
 
         try:
-            await message.edit(
-                content=(
-                    "✅ Backup process finished.\n"
-                    "Check your DMs for the backup ZIP."
+
+
+
+            logging.info("[Backup] Starting manual backup...")
+
+            await asyncio.to_thread(
+                self._create_backup,
+                zip_path,
+            )
+
+
+
+            parts = await asyncio.to_thread(
+                self._split_file,
+                zip_path,
+                temp_dir,
+            )
+
+            total_parts = len(parts)
+
+
+
+            user = await self._get_backup_user()
+
+            if user is None:
+                raise RuntimeError(
+                    "Could not find the backup Discord user."
                 )
-            )
-
-        except discord.HTTPException:
-            pass
 
 
-    @tasks.loop(
-        hours=BACKUP_INTERVAL_HOURS
-        if BACKUP_INTERVAL_HOURS
-        else 24
-    )
-    async def automatic_backup(self):
 
-        await self.bot.wait_until_ready()
-
-        await self._send_backup(
-            automatic=True
-        )
-
-    @automatic_backup.before_loop
-    async def before_automatic_backup(
-        self,
-    ):
-
-        await self.bot.wait_until_ready()
-
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-
-        # Only run the startup message once.
-        if getattr(
-            self,
-            "_startup_logged",
-            False,
-        ):
-            return
-
-        self._startup_logged = True
-
-        print(
-            "[Backup] Backup system loaded."
-        )
-
-        print(
-            f"[Backup] Backup recipient: "
-            f"{BACKUP_USER_ID}"
-        )
-
-        if BACKUP_INTERVAL_HOURS:
-            print(
-                f"[Backup] Automatic backups: "
-                f"every {BACKUP_INTERVAL_HOURS} hours"
-            )
-        else:
-            print(
-                "[Backup] Automatic backups disabled."
+            await user.send(
+                f"📦 **Modmail backup created**\n"
+                f"Backup date: <t:{int(datetime.now().timestamp())}:F>\n"
+                f"Parts: **{total_parts}**\n\n"
+                f"The backup files below are all parts of the same ZIP."
             )
 
 
-async def setup(
-    bot: commands.Bot,
-):
-    await bot.add_cog(
-        Backup(bot)
-    )
+
+            for index, part in enumerate(parts, start=1):
+
+                file_size = part.stat().st_size
+
+                logging.info(
+                    f"[Backup] Sending part "
+                    f"{index}/{total_parts} "
+                    f"({file_size / 1024 / 1024:.2f} MB)"
+                )
+
+                await user.send(
+                    content=(
+                        f"📦 Backup part **{index}/{total_parts}**"
+                    ),
+                    file=discord.File(
+                        str(part),
+                        filename=(
+                            f"modmail-backup-"
+                            f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+                            f"-part-{index}.zip"
+                        ),
+                    ),
+                )
+
+
+
+            await user.send(
+                "✅ **Backup upload complete.**\n"
+                "All temporary backup files have been deleted "
+                "from the server."
+            )
+
+            logging.info(
+                f"[Backup] Successfully sent "
+                f"{total_parts} backup part(s)."
+            )
+
+        except discord.HTTPException as error:
+
+            logging.error(
+                f"[Backup] Discord error while sending backup: {error}"
+            )
+
+            try:
+                await user.send(
+                    f"❌ **Backup upload failed.**\n"
+                    f"Discord returned: `{error}`"
+                )
+            except Exception:
+                pass
+
+        except Exception as error:
+
+            logging.exception(
+                f"[Backup] Backup failed: {error}"
+            )
+
+            try:
+                user = await self._get_backup_user()
+
+                if user:
+                    await user.send(
+                        f"❌ **Backup failed.**\n"
+                        f"`{error}`"
+                    )
+
+            except Exception:
+                pass
+
+        finally:
+
+
+
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+                logging.info(
+                    "[Backup] Temporary backup files deleted."
+                )
+
+            except Exception as error:
+                logging.error(
+                    f"[Backup] Could not clean temporary files: {error}"
+                )
+
+
+
+    @commands.command(name="backup")
+    @commands.is_owner()
+    async def backup(self, ctx):
+        """
+        Manually create a complete bot backup.
+
+        Usage:
+            .backup
+        """
+
+        await ctx.send(
+            "📦 Creating bot backup...\n"
+            "I'll DM the backup parts when it's ready."
+        )
+
+        # Don't block the command handler
+        asyncio.create_task(self._send_backup())
+
+
+async def setup(bot):
+    await bot.add_cog(ServerBackup(bot))
