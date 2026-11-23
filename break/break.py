@@ -154,23 +154,38 @@ class BreakPlugin(commands.Cog):
         embed.set_footer(text="Only new ModMail conversations are affected.")
         await ctx.send(embed=embed)
 
+
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
-        """Send the configured message to the user after a new thread is ready."""
+        """Send the configured opening message to the thread recipient."""
         settings = await self.get_settings()
         message = settings.get("message", "").strip()
+
         if not settings.get("enabled", False) or not message:
+            return
+
+        # The recipient is the user who opened the conversation.
+        recipient = thread.recipient
+
+        if recipient is None:
             return
 
         embed = discord.Embed(
             description=message,
             colour=discord.Colour.blurple(),
         )
+
         try:
-            await creator.send(embed=embed)
-        except (discord.Forbidden, discord.HTTPException):
-            # A user may have DMs disabled. Do not interfere with thread creation.
-            return
+            await recipient.send(embed=embed)
+        except discord.Forbidden:
+            self.bot.logger.warning(
+                "Break message could not be sent: user has DMs disabled."
+            )
+        except discord.HTTPException:
+            self.bot.logger.exception(
+                "Failed to send the Break opening message."
+            )
+
 
 
 async def setup(bot):
